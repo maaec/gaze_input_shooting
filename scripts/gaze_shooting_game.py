@@ -12,10 +12,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-try:
-    import pygame
-except ImportError:
-    pygame = None
+pygame = None
 
 
 # Landmark IDs used by MediaPipe FaceMesh.
@@ -58,7 +55,8 @@ POI_CANVAS_MAX_RADIUS_SCALE = 4.8
 POI_LIFT_SEC = 0.22
 POI_LIFT_SCALE = 1.24
 ALPHA_BLEND_PREP_CACHE = {}
-ALPHA_BLEND_PREP_CACHE_MAX = 128
+ALPHA_BLEND_PREP_CACHE_MAX = 512
+DEBUG_VIEW_FPS = 10.0
 
 FISH_TYPES = [
     {
@@ -116,6 +114,11 @@ def parse_args():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--screen-width", type=int, default=1920)
     parser.add_argument("--screen-height", type=int, default=1080)
+    parser.add_argument(
+        "--internal-render-720p",
+        action="store_true",
+        help="Render the game at 1280x720 and scale it to the requested display size.",
+    )
     parser.add_argument("--camera-profile", choices=["webcam", "smartphone", "custom"], default="custom")
 
     parser.add_argument("--calib-sec", type=float, default=5.0)
@@ -1481,22 +1484,27 @@ def _load_sound(path, volume):
 
 
 def init_audio(args):
-    global CATCH_SE_SOUND, BREAK_SE_SOUND, CLEAR_SE_SOUND
+    global CATCH_SE_SOUND, BREAK_SE_SOUND, CLEAR_SE_SOUND, pygame
 
     any_audio_enabled = not (
         args.no_bgm and args.no_catch_se and args.no_break_se and args.no_clear_se
     )
-    if pygame is None:
-        if any_audio_enabled:
-            print("[WARN] pygame is not installed; BGM/SE disabled.")
+    if not any_audio_enabled:
         return
 
-    if any_audio_enabled:
+    if pygame is None:
         try:
-            pygame.mixer.init()
-        except Exception as e:
-            print(f"[WARN] Could not initialize audio mixer: {e}")
+            import pygame as pygame_module
+            pygame = pygame_module
+        except ImportError:
+            print("[WARN] pygame is not installed; BGM/SE disabled.")
             return
+
+    try:
+        pygame.mixer.init()
+    except Exception as e:
+        print(f"[WARN] Could not initialize audio mixer: {e}")
+        return
 
     if not args.no_bgm:
         path = _audio_path(args.bgm_file, "bgm.wav")
@@ -1675,6 +1683,17 @@ def run_center_calibration(cap, face_mesh, args, smoother):
 def main():
     args = parse_args()
 
+    display_width = int(args.screen_width)
+    display_height = int(args.screen_height)
+    if args.internal_render_720p:
+        args.screen_width = 1280
+        args.screen_height = 720
+        print(
+            "Internal rendering: "
+            f"{args.screen_width} x {args.screen_height} -> "
+            f"{display_width} x {display_height}"
+        )
+
     cap = open_capture(args)
     if cap is None:
         print("[ERROR] Camera could not be opened.")
@@ -1683,7 +1702,7 @@ def main():
     init_audio(args)
 
     cv2.namedWindow("gaze_shooting", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("gaze_shooting", args.screen_width, args.screen_height)
+    cv2.resizeWindow("gaze_shooting", display_width, display_height)
     cv2.namedWindow("camera_landmarks", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("camera_landmarks", 640, 480)
     if args.fullscreen:
@@ -1766,6 +1785,7 @@ def main():
             fps = 0.0
             perf = {}
             profiler = PerformanceProfiler(args.profile_report_sec)
+            last_debug_show_time = 0.0
 
             while True:
                 frame_t0 = time.perf_counter()
@@ -1875,7 +1895,14 @@ def main():
                 )
                 draw_done = time.perf_counter()
 
-                debug_view = draw_landmark_view(frame, info)
+                # The landmark window is for observation, so it does not need to
+                # be redrawn at the game frame rate.  Limiting only this window
+                # avoids an extra annotation pass and GUI upload on every frame.
+                debug_view = None
+                debug_now = time.perf_counter()
+                if debug_now - last_debug_show_time >= 1.0 / DEBUG_VIEW_FPS:
+                    debug_view = draw_landmark_view(frame, info)
+                    last_debug_show_time = debug_now
                 debug_draw_done = time.perf_counter()
 
                 fps_frames += 1
@@ -1942,8 +1969,9 @@ FISH_SPRITES = None
 FISH_RESIZED_SPRITE_CACHE = {}
 FISH_WARP_GRID_CACHE = {}
 FISH_RENDER_CACHE = {}
-FISH_RENDER_CACHE_MAX = 160
+FISH_RENDER_CACHE_MAX = 384
 FISH_ANIMATION_FPS = 10.0
+FISH_ANIMATION_PHASES = 12
 FISH_ANGLE_BUCKET_DEG = 8.0
 FISH_WIGGLE_SPEED = 3.4
 FISH_WIGGLE_SPEED_BY_MOVE = 0.28
@@ -2081,7 +2109,9 @@ def _fish_shadow_key(sprite_key):
 
 def prune_fish_render_cache(current_frame_bucket):
     if len(FISH_RENDER_CACHE) > FISH_RENDER_CACHE_MAX:
-        FISH_RENDER_CACHE.clear()
+        remove_count = max(1, FISH_RENDER_CACHE_MAX // 4)
+        for key in list(FISH_RENDER_CACHE)[:remove_count]:
+            FISH_RENDER_CACHE.pop(key, None)
 
 
 def resize_fish_sprite_cached(sprite, sprite_key, radius, size_multiplier=1.0):
@@ -2098,7 +2128,8 @@ def resize_fish_sprite_cached(sprite, sprite_key, radius, size_multiplier=1.0):
     return resized
 
 
-def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1.0):
+def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1.0,
+                     phase_override=None):
     radius = max(8, int(_fish_value(fish, "radius", 24)))
     sprite_key = cache_sprite_key or _fish_sprite_key(fish)
     resized = resize_fish_sprite_cached(sprite, sprite_key, radius, size_multiplier)
@@ -2124,7 +2155,12 @@ def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1
         float(_fish_value(fish, "vy", 0.0)),
     )
     speed_bonus = min(FISH_WIGGLE_SPEED_MAX_BONUS, (move_speed / max(1.0, float(radius))) * FISH_WIGGLE_SPEED_BY_MOVE)
-    phase = float(now) * (FISH_WIGGLE_SPEED + speed_bonus) + float(_fish_value(fish, "wiggle_phase", _fish_value(fish, "phase", 0.0)))
+    phase = (
+        float(phase_override)
+        if phase_override is not None
+        else float(now) * (FISH_WIGGLE_SPEED + speed_bonus)
+        + float(_fish_value(fish, "wiggle_phase", _fish_value(fish, "phase", 0.0)))
+    )
     amplitude = max(1.5, radius * 0.18)
 
     wave = np.sin(phase - y_norm * math.tau * FISH_WIGGLE_BODY_WAVE) * amplitude * tail_weight
@@ -2234,7 +2270,7 @@ def trim_rgba_keep_center(rgba, margin=4):
     return rgba[y1:y2, x1:x2].copy()
 
 
-def alpha_blend(frame, rgba, center_x, center_y):
+def alpha_blend(frame, rgba, center_x, center_y, cache_prepared=True):
     if rgba is None or rgba.size == 0 or rgba.shape[2] < 4:
         return False
 
@@ -2258,15 +2294,16 @@ def alpha_blend(frame, rgba, center_x, center_y):
     sprite_y2 = sprite_y1 + (roi_y2 - roi_y1)
 
     cache_key = id(rgba)
-    prepared = ALPHA_BLEND_PREP_CACHE.get(cache_key)
+    prepared = ALPHA_BLEND_PREP_CACHE.get(cache_key) if cache_prepared else None
     if prepared is None or prepared[0] is not rgba:
         alpha_full = rgba[:, :, 3:4].astype(np.uint16)
         premultiplied_full = rgba[:, :, :3].astype(np.uint16) * alpha_full
         inverse_alpha_full = 255 - alpha_full
-        if len(ALPHA_BLEND_PREP_CACHE) >= ALPHA_BLEND_PREP_CACHE_MAX:
-            ALPHA_BLEND_PREP_CACHE.pop(next(iter(ALPHA_BLEND_PREP_CACHE)))
         prepared = (rgba, premultiplied_full, inverse_alpha_full)
-        ALPHA_BLEND_PREP_CACHE[cache_key] = prepared
+        if cache_prepared:
+            if len(ALPHA_BLEND_PREP_CACHE) >= ALPHA_BLEND_PREP_CACHE_MAX:
+                ALPHA_BLEND_PREP_CACHE.pop(next(iter(ALPHA_BLEND_PREP_CACHE)))
+            ALPHA_BLEND_PREP_CACHE[cache_key] = prepared
 
     premultiplied = prepared[1][sprite_y1:sprite_y2, sprite_x1:sprite_x2]
     inverse_alpha = prepared[2][sprite_y1:sprite_y2, sprite_x1:sprite_x2]
@@ -2321,16 +2358,38 @@ def draw_water_grass(screen):
         src_h, src_w = sprite.shape[:2]
         target_w = max(16, int(target_h * src_w / max(1, src_h)))
         cache_key = (key, target_w, target_h)
-        resized = WATER_GRASS_RESIZED_CACHE.get(cache_key)
-        if resized is None:
+        cached_grass = WATER_GRASS_RESIZED_CACHE.get(cache_key)
+        if cached_grass is None:
             resized = cv2.resize(sprite, (target_w, target_h), interpolation=cv2.INTER_AREA)
             resized[:, :, :3] = cv2.convertScaleAbs(resized[:, :, :3], alpha=WATER_GRASS_DARKEN_ALPHA, beta=0)
-            WATER_GRASS_RESIZED_CACHE[cache_key] = resized
+            alpha_mask = resized[:, :, 3]
+            nonzero = cv2.findNonZero(alpha_mask)
+            if nonzero is not None:
+                crop_x, crop_y, crop_w, crop_h = cv2.boundingRect(nonzero)
+                margin = 2
+                x1 = max(0, crop_x - margin)
+                y1 = max(0, crop_y - margin)
+                x2 = min(target_w, crop_x + crop_w + margin)
+                y2 = min(target_h, crop_y + crop_h + margin)
+                center_offset_x = (x1 + x2 - target_w) * 0.5
+                center_offset_y = (y1 + y2 - target_h) * 0.5
+                resized = resized[y1:y2, x1:x2].copy()
+            else:
+                center_offset_x = 0.0
+                center_offset_y = 0.0
+            cached_grass = (resized, center_offset_x, center_offset_y)
+            WATER_GRASS_RESIZED_CACHE[cache_key] = cached_grass
+        resized, center_offset_x, center_offset_y = cached_grass
 
         phase = now * WATER_GRASS_SWAY_FPS + index * 1.7
         sway_x = math.sin(phase) * w * WATER_GRASS_SWAY_X_RATIO
         sway_y = math.sin(phase * 0.7 + 0.8) * h * WATER_GRASS_SWAY_Y_RATIO
-        alpha_blend(screen, resized, w * x_ratio + sway_x, h * y_ratio + sway_y)
+        alpha_blend(
+            screen,
+            resized,
+            w * x_ratio + sway_x + center_offset_x,
+            h * y_ratio + sway_y + center_offset_y,
+        )
 
 
 def draw_fish_shadow(frame, center_x, center_y, sprite_w, sprite_h, radius):
@@ -2392,14 +2451,22 @@ def draw_fish_sprite(frame, fish, now):
 
     radius = max(8, int(_fish_value(fish, "radius", 24)))
     angle_bucket = int(round(angle / FISH_ANGLE_BUCKET_DEG))
+    move_speed = math.hypot(float(_fish_value(fish, "vx", 0.0)), float(_fish_value(fish, "vy", 0.0)))
+    speed_bonus = min(
+        FISH_WIGGLE_SPEED_MAX_BONUS,
+        (move_speed / max(1.0, float(radius))) * FISH_WIGGLE_SPEED_BY_MOVE,
+    )
+    phase = float(now) * (FISH_WIGGLE_SPEED + speed_bonus)
+    phase_bucket = int((phase % math.tau) / math.tau * FISH_ANIMATION_PHASES) % FISH_ANIMATION_PHASES
     frame_bucket = int(float(now) * FISH_ANIMATION_FPS)
-    cache_key = (id(fish), key, radius, angle_bucket, frame_bucket)
+    cache_key = (key, radius, angle_bucket, phase_bucket)
     rotated = FISH_RENDER_CACHE.get(cache_key)
     if rotated is None:
-        warped = warp_fish_sprite(sprite, fish, frame_bucket / FISH_ANIMATION_FPS)
+        phase_value = phase_bucket / float(FISH_ANIMATION_PHASES) * math.tau
+        warped = warp_fish_sprite(sprite, fish, now, phase_override=phase_value)
         rotated = _rotate_rgba(warped, angle_bucket * FISH_ANGLE_BUCKET_DEG)
         if key == "rare":
-            rotated = add_gold_sparkles(rotated, frame_bucket)
+            rotated = add_gold_sparkles(rotated, phase_bucket)
         rotated = trim_rgba_keep_center(rotated, margin=max(3, int(radius * 0.16)))
         prune_fish_render_cache(frame_bucket)
         FISH_RENDER_CACHE[cache_key] = rotated
@@ -2422,7 +2489,10 @@ def draw_fish_sprite(frame, fish, now):
             prune_fish_render_cache(frame_bucket)
             FISH_RENDER_CACHE[shadow_cache_key] = shadow_rotated
         shadow_offset = max(3, int(radius * 0.34))
-        alpha_blend(frame, shadow_rotated, float(x) + shadow_offset, float(y) + shadow_offset)
+        alpha_blend(
+            frame, shadow_rotated, float(x) + shadow_offset,
+            float(y) + shadow_offset,
+        )
     return alpha_blend(frame, rotated, float(x), float(y))
 
 
