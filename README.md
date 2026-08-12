@@ -19,7 +19,7 @@
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install opencv-python==4.11.0.86 mediapipe==0.10.21 numpy==1.26.4 pygame==2.6.1
+python -m pip install opencv-contrib-python==4.11.0.86 mediapipe==0.10.21 numpy==1.26.4 pygame==2.6.1
 ```
 
 PygameはBGMと効果音の再生に使用します。音声をすべて無効にして実行する場合は、Pygameを使用しません。
