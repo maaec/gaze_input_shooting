@@ -57,6 +57,8 @@ POI_LIFT_SCALE = 1.24
 ALPHA_BLEND_PREP_CACHE = {}
 ALPHA_BLEND_PREP_CACHE_MAX = 512
 DEBUG_VIEW_FPS = 10.0
+TITLE_LOGO = None
+TITLE_LOGO_CACHE = {}
 
 FISH_TYPES = [
     {
@@ -485,6 +487,59 @@ def draw_grid(screen):
     line_th = scaled(2, 1080, h)
     cv2.line(screen, (w // 2, 0), (w // 2, h), (80, 80, 80), line_th)
     cv2.line(screen, (0, h // 2), (w, h // 2), (80, 80, 80), line_th)
+
+
+def load_title_logo():
+    global TITLE_LOGO
+    if TITLE_LOGO is not None:
+        return TITLE_LOGO
+
+    logo_path = Path(__file__).resolve().parent.parent / "img" / "kingyo_logo_transparent.png"
+    logo = cv2.imread(str(logo_path), cv2.IMREAD_UNCHANGED)
+    if logo is None:
+        print(f"[WARN] Title logo could not be loaded: {logo_path}")
+        return None
+    TITLE_LOGO = ensure_bgra(logo)
+    return TITLE_LOGO
+
+
+def draw_title_screen(w, h):
+    screen = np.zeros((h, w, 3), dtype=np.uint8)
+    draw_water_background(screen)
+    draw_water_grass(screen)
+
+    logo = load_title_logo()
+    if logo is not None:
+        max_w = max(1, int(w * 0.82))
+        max_h = max(1, int(h * 0.72))
+        src_h, src_w = logo.shape[:2]
+        scale = min(max_w / max(1, src_w), max_h / max(1, src_h))
+        target_w = max(1, int(round(src_w * scale)))
+        target_h = max(1, int(round(src_h * scale)))
+        cache_key = (target_w, target_h)
+        resized = TITLE_LOGO_CACHE.get(cache_key)
+        if resized is None:
+            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            resized = cv2.resize(logo, (target_w, target_h), interpolation=interpolation)
+            TITLE_LOGO_CACHE[cache_key] = resized
+        alpha_blend(screen, resized, w / 2.0, h * 0.43)
+
+    draw_centered_text(
+        screen,
+        "Press Enter to start calibration",
+        h - scaled(105, 1080, h),
+        color=(255, 255, 255),
+        scale=1.0 * h / 1080,
+        thickness=scaled(3, 1080, h),
+    )
+    draw_centered_text(
+        screen,
+        "Press q to quit",
+        h - scaled(55, 1080, h),
+        scale=0.72 * h / 1080,
+        thickness=scaled(2, 1080, h),
+    )
+    return screen
 
 
 def draw_wait_screen(w, h, radius):
@@ -1726,6 +1781,30 @@ def main():
             baseline_feature = None
             calib_smoother.reset()
 
+            # First Enter: move from the title screen to calibration preparation.
+            while True:
+                frame, _, info = process_frame(
+                    cap, face_mesh, args, calib_smoother, args.calib_beta
+                )
+                landmark_view = draw_landmark_view(frame, info)
+                if landmark_view is not None:
+                    cv2.imshow("camera_landmarks", landmark_view)
+                cv2.imshow(
+                    "gaze_shooting",
+                    draw_title_screen(args.screen_width, args.screen_height),
+                )
+
+                key = cv2.waitKey(1) & 0xFF
+                if key in (13, 10):
+                    break
+                if key == ord("q"):
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    return
+
+            calib_smoother.reset()
+
+            # Second Enter: start calibration after a valid face sample is ready.
             while True:
                 frame, feature, info = process_frame(cap, face_mesh, args, calib_smoother, args.calib_beta)
 

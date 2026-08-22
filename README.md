@@ -6,7 +6,7 @@
 
 - Windows 11
 - Python 3.12.10
-- OpenCV (`opencv-python`) 4.11.0.86
+- OpenCV (`opencv-contrib-python`) 4.11.0.86
 - MediaPipe 0.10.21
 - NumPy 1.26.4
 - Pygame 2.6.1
@@ -58,5 +58,5 @@ python .\scripts\gaze_shooting_game.py --camera 1 --internal-render-720p --no-bg
 
 ```powershell
 python --version
-python -m pip show opencv-python mediapipe numpy pygame
+python -m pip show opencv-contrib-python mediapipe numpy pygame
 ```
